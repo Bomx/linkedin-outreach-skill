@@ -1,0 +1,41 @@
+# Local LinkedIn state: never commit account/session data or outreach history.
+.linkedin-outreach/
+linkedin-outreach-data/
+session/
+db/
+exports/
+screenshots/
+storage_state.json
+session_meta.json
+leads.json
+signals.json
+templates.json
+actions.jsonl
+runs.jsonl
+*.cookies.json
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs / scratch
+*.log
+.tmp/
+tmp/

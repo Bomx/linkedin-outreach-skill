@@ -1,0 +1,4 @@
+interface:
+  display_name: "LinkedIn Local Outreach"
+  short_description: "Local lead scouting and outreach tracking"
+  default_prompt: "Use $linkedin-outreach to scout warm LinkedIn leads locally, review them, and track connection or DM actions."
