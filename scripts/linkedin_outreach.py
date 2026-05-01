@@ -18,7 +18,7 @@ import random
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote_plus, urlparse, urlunparse
@@ -74,14 +74,40 @@ DEFAULT_TEMPLATES = {
 }
 
 CONNECTION_CACHED_SKIP_STATUSES = {"sent", "pending", "connected", "skipped"}
+DEFAULT_SUPPRESSIONS = {"version": 1, "updated_at": None, "profiles": []}
+DEFAULT_SAFETY_STATE = {"version": 1, "updated_at": None, "cooldown_until": None, "last_stop": None}
+STOP_CONDITION_COOLDOWN_HOURS = 24
+BROWSER_COMMANDS = {
+    "scout-search",
+    "scout-activity",
+    "scout-comment-keyword",
+    "scout-post",
+    "signal-run",
+    "connect",
+    "sync-connections",
+    "dm",
+}
 
 
 class UserFacingError(Exception):
     """An expected problem that should be shown cleanly to the operator."""
 
 
+class LinkedInStopCondition(UserFacingError):
+    """A LinkedIn checkpoint/security condition that should trigger cooldown."""
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_iso(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def log(message: str) -> None:
@@ -328,6 +354,8 @@ class DataStore:
         self.runs_path = self.db_dir / "runs.jsonl"
         self.templates_path = self.db_dir / "templates.json"
         self.signals_path = self.db_dir / "signals.json"
+        self.suppressions_path = self.db_dir / "suppressions.json"
+        self.safety_path = self.db_dir / "safety_state.json"
         self.exports_dir = self.base_dir / "exports"
         self.screenshots_dir = self.base_dir / "screenshots"
 
@@ -346,6 +374,10 @@ class DataStore:
             write_json_atomic(self.templates_path, DEFAULT_TEMPLATES)
         if not self.signals_path.exists():
             write_json_atomic(self.signals_path, {"version": 1, "updated_at": now_iso(), "signals": []})
+        if not self.suppressions_path.exists():
+            write_json_atomic(self.suppressions_path, {**DEFAULT_SUPPRESSIONS, "updated_at": now_iso()})
+        if not self.safety_path.exists():
+            write_json_atomic(self.safety_path, {**DEFAULT_SAFETY_STATE, "updated_at": now_iso()})
 
     def load_leads_doc(self) -> Dict[str, Any]:
         self.ensure()
@@ -384,6 +416,71 @@ class DataStore:
         doc["updated_at"] = now_iso()
         write_json_atomic(self.signals_path, doc)
 
+    def load_suppressions_doc(self) -> Dict[str, Any]:
+        self.ensure()
+        doc = safe_read_json(self.suppressions_path, {**DEFAULT_SUPPRESSIONS, "updated_at": now_iso()})
+        if not isinstance(doc, dict) or not isinstance(doc.get("profiles"), list):
+            raise UserFacingError(f"Unexpected suppressions database format: {self.suppressions_path}")
+        return doc
+
+    def suppressed_profile_map(self) -> Dict[str, Dict[str, Any]]:
+        suppressed: Dict[str, Dict[str, Any]] = {}
+        for row in self.load_suppressions_doc().get("profiles", []):
+            profile_url = normalize_profile_url(row.get("profile_url"))
+            if profile_url:
+                suppressed[profile_url] = row
+            handle = (row.get("profile_handle") or "").strip().lower()
+            if handle:
+                suppressed[f"handle:{handle}"] = row
+        return suppressed
+
+    def load_safety_state(self) -> Dict[str, Any]:
+        self.ensure()
+        doc = safe_read_json(self.safety_path, {**DEFAULT_SAFETY_STATE, "updated_at": now_iso()})
+        if not isinstance(doc, dict):
+            raise UserFacingError(f"Unexpected safety state format: {self.safety_path}")
+        for key, value in DEFAULT_SAFETY_STATE.items():
+            doc.setdefault(key, value)
+        return doc
+
+    def save_safety_state(self, doc: Dict[str, Any]) -> None:
+        doc["updated_at"] = now_iso()
+        write_json_atomic(self.safety_path, doc)
+
+    def record_stop_condition(self, stop: str, screenshot: Optional[str] = None) -> Dict[str, Any]:
+        cooldown_until = (datetime.now(timezone.utc) + timedelta(hours=STOP_CONDITION_COOLDOWN_HOURS)).replace(microsecond=0)
+        doc = self.load_safety_state()
+        doc["cooldown_until"] = cooldown_until.isoformat().replace("+00:00", "Z")
+        doc["last_stop"] = {
+            "condition": stop,
+            "detected_at": now_iso(),
+            "cooldown_hours": STOP_CONDITION_COOLDOWN_HOURS,
+            "screenshot": screenshot,
+        }
+        self.save_safety_state(doc)
+        self.log_action("linkedin_stop_condition", None, condition=stop, cooldown_until=doc["cooldown_until"], screenshot=screenshot)
+        return doc
+
+    def active_cooldown(self) -> Optional[Dict[str, Any]]:
+        doc = self.load_safety_state()
+        cooldown_until = parse_iso(doc.get("cooldown_until"))
+        if cooldown_until and cooldown_until > datetime.now(timezone.utc):
+            return doc
+        return None
+
+    def assert_no_active_cooldown(self, force: bool = False) -> None:
+        active = self.active_cooldown()
+        if not active or force:
+            return
+        last_stop = active.get("last_stop") or {}
+        raise UserFacingError(
+            "LinkedIn safety cooldown is active until "
+            f"{active.get('cooldown_until')} after stop condition "
+            f"{last_stop.get('condition') or 'unknown'}. "
+            "Open LinkedIn manually, resolve any verification, and wait before resuming. "
+            "Use --force-cooldown-override only if you have manually resolved the issue and accept the risk."
+        )
+
     def log_action(self, action_type: str, lead: Optional[Dict[str, Any]] = None, **details: Any) -> None:
         row = {
             "timestamp": now_iso(),
@@ -410,6 +507,7 @@ class DataStore:
         doc = self.load_leads_doc()
         leads = doc["leads"]
         by_url = {lead.get("profile_url"): lead for lead in leads}
+        suppressed = self.suppressed_profile_map()
         inserted = 0
         updated = 0
         changed_rows: List[Dict[str, Any]] = []
@@ -421,6 +519,17 @@ class DataStore:
             if not profile_url:
                 continue
             candidate["profile_url"] = profile_url
+            handle_key = f"handle:{profile_handle(profile_url).lower()}"
+            if profile_url in suppressed or handle_key in suppressed:
+                suppression = suppressed.get(profile_url) or suppressed.get(handle_key) or {}
+                self.log_action(
+                    "lead_suppressed",
+                    None,
+                    profile_url=profile_url,
+                    full_name=candidate.get("full_name"),
+                    reason=suppression.get("reason") or "suppressed_profile",
+                )
+                continue
             source = candidate.get("source") or {}
             timestamp = now_iso()
             existing = by_url.get(profile_url)
@@ -579,15 +688,31 @@ def detect_stop_condition(page) -> Optional[str]:
     return None
 
 
+def stop_condition_screenshot(page, store: DataStore) -> Optional[str]:
+    try:
+        screenshot = store.screenshots_dir / f"stop_condition_{int(time.time())}.png"
+        page.screenshot(path=str(screenshot))
+        return str(screenshot)
+    except Exception:
+        return None
+
+
+def raise_stop_condition(store: DataStore, stop: str, page=None) -> None:
+    screenshot = stop_condition_screenshot(page, store) if page is not None else None
+    safety = store.record_stop_condition(stop, screenshot=screenshot)
+    message = f"LinkedIn stop condition detected: {stop}. Safety cooldown until {safety.get('cooldown_until')}"
+    if screenshot:
+        message += f". Screenshot: {screenshot}"
+    raise LinkedInStopCondition(message)
+
+
 def ensure_session(page, store: DataStore) -> None:
     log("Checking local LinkedIn session")
     page.goto(LINKEDIN_FEED_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     time.sleep(2)
     stop = detect_stop_condition(page)
     if stop:
-        screenshot = store.screenshots_dir / f"stop_condition_{int(time.time())}.png"
-        page.screenshot(path=str(screenshot))
-        raise UserFacingError(f"LinkedIn stop condition detected: {stop}. Screenshot: {screenshot}")
+        raise_stop_condition(store, stop, page)
     if not is_logged_in(page):
         raise UserFacingError("LinkedIn session is not logged in. Run the login command first.")
 
@@ -1428,7 +1553,7 @@ def cmd_scout_search(args) -> Dict[str, Any]:
                 incremental_scroll(page, args.scrolls)
                 stop = detect_stop_condition(page)
                 if stop:
-                    raise UserFacingError(f"LinkedIn stop condition detected: {stop}")
+                    raise_stop_condition(store, stop, page)
                 rows = extract_search_results(page, query)
                 for row in rows:
                     profile_url = normalize_profile_url(row.get("profile_url"))
@@ -1507,7 +1632,7 @@ def cmd_scout_activity(args) -> Dict[str, Any]:
                 expand_comments(page, rounds=args.expand_rounds)
                 stop = detect_stop_condition(page)
                 if stop:
-                    raise UserFacingError(f"LinkedIn stop condition detected: {stop}")
+                    raise_stop_condition(store, stop, page)
                 for row in extract_comment_authors(page):
                     profile_url = normalize_profile_url(row.get("profile_url"))
                     if not profile_url:
@@ -1599,7 +1724,7 @@ def cmd_scout_comment_keyword(args) -> Dict[str, Any]:
                 expand_comments(page, rounds=args.expand_rounds)
                 stop = detect_stop_condition(page)
                 if stop:
-                    raise UserFacingError(f"LinkedIn stop condition detected: {stop}")
+                    raise_stop_condition(store, stop, page)
                 for row in extract_comment_authors(page):
                     snippet = row.get("comment_text") or row.get("snippet")
                     if not text_matches_any(snippet, keywords):
@@ -1674,7 +1799,7 @@ def cmd_scout_post(args) -> Dict[str, Any]:
             expand_comments(page, rounds=args.expand_rounds)
             stop = detect_stop_condition(page)
             if stop:
-                raise UserFacingError(f"LinkedIn stop condition detected: {stop}")
+                raise_stop_condition(store, stop, page)
             rows = extract_comment_authors(page)
             for row in rows:
                 profile_url = normalize_profile_url(row.get("profile_url"))
@@ -2061,7 +2186,7 @@ def send_connection(page, store: DataStore, lead: Dict[str, Any], note: str, nav
     used_navigation = open_profile_for_connection(page, lead, navigation_mode)
     stop = detect_stop_condition(page)
     if stop:
-        raise UserFacingError(f"LinkedIn stop condition detected: {stop}")
+        raise_stop_condition(store, stop, page)
 
     if is_first_degree(page):
         store.update_leads([lead["id"]], {"connection_status": "connected"}, "connection_already_connected")
@@ -2197,7 +2322,7 @@ def sync_connection_status(page, store: DataStore, lead: Dict[str, Any]) -> Dict
     human_delay(2.0, 3.5)
     stop = detect_stop_condition(page)
     if stop:
-        raise UserFacingError(f"LinkedIn stop condition detected: {stop}")
+        raise_stop_condition(store, stop, page)
 
     if is_first_degree(page):
         updates: Dict[str, Any] = {
@@ -2309,7 +2434,7 @@ def send_dm(page, store: DataStore, lead: Dict[str, Any], message: str) -> Dict[
     human_delay(2.0, 3.5)
     stop = detect_stop_condition(page)
     if stop:
-        raise UserFacingError(f"LinkedIn stop condition detected: {stop}")
+        raise_stop_condition(store, stop, page)
     if not is_first_degree(page):
         store.log_action("dm_failed", lead, reason="not_first_degree")
         return {"lead_id": lead["id"], "status": "skipped", "reason": "not_first_degree"}
@@ -2364,6 +2489,8 @@ def cmd_status(args) -> Dict[str, Any]:
     store = DataStore(args.data_dir)
     store.ensure()
     leads = store.load_leads_doc()["leads"]
+    safety_state = store.load_safety_state()
+    active_cooldown = store.active_cooldown()
     by_status: Dict[str, int] = {}
     by_connection: Dict[str, int] = {}
     by_message: Dict[str, int] = {}
@@ -2379,6 +2506,12 @@ def cmd_status(args) -> Dict[str, Any]:
         "by_messaging_status": by_message,
         "data_dir": str(store.base_dir),
         "leads_path": str(store.leads_path),
+        "safety": {
+            "cooldown_active": bool(active_cooldown),
+            "cooldown_until": safety_state.get("cooldown_until"),
+            "last_stop": safety_state.get("last_stop"),
+            "safety_path": str(store.safety_path),
+        },
     }
 
 
@@ -2447,10 +2580,15 @@ def add_common_browser_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-dir", default=None, help="Override local data directory.")
     parser.add_argument("--headless", action="store_true", help="Run browser headless. Not recommended for login.")
     parser.add_argument("--channel", default=None, help='Optional Playwright browser channel, e.g. "chrome".')
+    parser.add_argument(
+        "--force-cooldown-override",
+        action="store_true",
+        help="Bypass the local safety cooldown after manually resolving LinkedIn verification. Use sparingly.",
+    )
 
 
 def add_connection_after_scout_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--connection-limit", type=int, default=20, help="Target successful connection sends after scouting.")
+    parser.add_argument("--connection-limit", type=int, default=5, help="Target successful connection sends after scouting.")
     parser.add_argument("--connection-min-score", type=float, default=0.0, help="Minimum score for auto connection attempts.")
     parser.add_argument("--connection-intent", default=None, help="Optional intent labels eligible for auto connection, comma-separated.")
     parser.add_argument("--connection-message", default=None, help="Final custom connection note text. Only valid for one selected lead.")
@@ -2591,7 +2729,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_browser_args(sync_connections)
     sync_connections.add_argument("--lead-id", action="append", help="Specific lead ID. Repeatable.")
     sync_connections.add_argument("--contacted", action="store_true", help="Sync contacted leads with sent/pending/connected connection status.")
-    sync_connections.add_argument("--limit", type=int, default=20, help="Max profiles to check.")
+    sync_connections.add_argument("--limit", type=int, default=12, help="Max profiles to check.")
     sync_connections.add_argument("--min-score", type=float, default=0.0, help="Minimum lead score.")
     sync_connections.add_argument("--min-delay", type=float, default=8.0, help="Minimum delay between profile checks.")
     sync_connections.add_argument("--max-delay", type=float, default=18.0, help="Maximum delay between profile checks.")
@@ -2622,12 +2760,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def command_needs_browser(args) -> bool:
+    command = getattr(args, "command", "")
+    if command not in BROWSER_COMMANDS:
+        return False
+    if command in {"connect", "dm"}:
+        return bool(getattr(args, "execute", False))
+    return True
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if getattr(args, "data_dir", None) is None and getattr(args, "global_data_dir", None):
         args.data_dir = args.global_data_dir
     try:
+        if command_needs_browser(args):
+            DataStore(getattr(args, "data_dir", None)).assert_no_active_cooldown(
+                force=bool(getattr(args, "force_cooldown_override", False))
+            )
         result = args.func(args)
         command = args.command
         try:

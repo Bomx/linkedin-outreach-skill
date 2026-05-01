@@ -168,7 +168,7 @@ python3 scripts/linkedin_outreach.py connect \
 Before DMs, sync accepted connections:
 
 ```bash
-python3 scripts/linkedin_outreach.py sync-connections --contacted --limit 20
+python3 scripts/linkedin_outreach.py sync-connections --contacted --limit 12
 ```
 
 Send one first-degree DM:
@@ -187,6 +187,9 @@ python3 scripts/linkedin_outreach.py dm \
 - Custom connection notes are allowed only for exactly one selected lead.
 - The browser is visible for login and runs locally.
 - The script stops on LinkedIn checkpoints, CAPTCHA, restrictions, or unusual security prompts.
+- Stop conditions record a 24-hour local safety cooldown in `~/.linkedin-outreach/db/safety_state.json`.
+- Browser-heavy commands refuse to start during an active cooldown unless the operator manually resolves LinkedIn and passes `--force-cooldown-override`.
+- Suppressed profiles in `~/.linkedin-outreach/db/suppressions.json` are skipped during future lead upserts.
 - Already `sent`, `pending`, `connected`, or `skipped` leads are not reopened for duplicate connection requests.
 - `sync-connections` should run before DMs so accepted requests are marked `connected`.
 

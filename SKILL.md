@@ -1,6 +1,6 @@
 ---
 name: linkedin-outreach
-description: Local LinkedIn lead scouting and outreach automation for a user's own personal account on their own Mac/IP. Use when Codex needs to create or operate an installable agent skill that logs in manually through a visible local browser, saves the local LinkedIn session/cookies, scouts warm high-intent leads from LinkedIn search or post commenters, queues reviewed leads, sends connection requests or first-degree DMs only after explicit execution, and tracks spotted leads, queued leads, sent connections, sent DMs, and run history in local JSON files.
+description: Local LinkedIn lead scouting and outreach automation for a user's own personal account on their own Mac/IP. Use when the user wants to log in to LinkedIn through a visible local browser, save the local LinkedIn session/cookies, scout warm high-intent leads from LinkedIn search or post commenters, queue reviewed leads, send connection requests or first-degree DMs only after explicit execution, and track spotted leads, queued leads, sent connections, sent DMs, and run history in local JSON files.
 ---
 
 # LinkedIn Outreach
@@ -16,6 +16,7 @@ Use this skill for personal-account LinkedIn workflows that run on the user's ow
 5. Keep daily limits low. Prefer 3-5 connection requests and 3-10 DMs per run unless the user intentionally changes the cap.
 6. Stop if LinkedIn shows a checkpoint, CAPTCHA, restricted-account warning, or any unusual security prompt. Ask the user to handle it manually.
 7. Log every material event to the local JSON database so the next agent can resume without guessing.
+8. If LinkedIn shows CAPTCHA, checkpoint, identity verification, restriction, or unusual-activity text, the script records a 24-hour safety cooldown in `~/.linkedin-outreach/db/safety_state.json`. Do not bypass this unless the user has manually resolved LinkedIn in their normal browser and explicitly accepts the risk.
 
 For the detailed safety and database rules, read `references/operating_rules.md` and `references/database_schema.md` when changing the workflow or interpreting stored records.
 
@@ -110,13 +111,13 @@ python3 scripts/linkedin_outreach.py scout-post \
 
 All scout commands upsert leads into the JSON database and keep source evidence. If the same person appears in multiple signals, their `source_history` accumulates those signals.
 
-Every scout run also runs a post-scout connection-attempt phase against newly changed leads. It queues eligible leads and dry-runs up to 20 connection requests by default:
+Every scout run can also run a post-scout connection-attempt phase against newly changed leads. It queues eligible leads and dry-runs up to 5 connection requests by default:
 
 ```bash
 python3 scripts/linkedin_outreach.py scout-search \
   --query "looking for SEO consultant" \
   --intent buyer_intent \
-  --connection-limit 20 \
+  --connection-limit 5 \
   --connection-intent buyer_intent
 ```
 
@@ -126,7 +127,7 @@ Actually send those post-scout connection requests only when the user explicitly
 python3 scripts/linkedin_outreach.py scout-search \
   --query "looking for SEO consultant" \
   --intent buyer_intent \
-  --connection-limit 20 \
+  --connection-limit 5 \
   --connection-intent buyer_intent \
   --connection-new-only \
   --connection-navigation-mode random \
@@ -134,6 +135,16 @@ python3 scripts/linkedin_outreach.py scout-search \
 ```
 
 In live post-scout runs, `--connection-limit` is the target number of successful new invitations. If a selected lead is already pending or connected on LinkedIn, it does not count toward that target and the runner continues through the eligible candidate pool. Use `--connection-new-only` when the run should only auto-connect leads inserted during the current scout. Use `--connection-navigation-mode random` to mix direct profile URL loads with LinkedIn click-through attempts. Use `--no-connect` to scout without the connection-attempt phase.
+
+For a "full pipeline", prefer safe chunks instead of one long browser-heavy session:
+
+```bash
+python3 scripts/linkedin_outreach.py sync-connections --contacted --limit 12
+python3 scripts/linkedin_outreach.py dm --lead-id li_reviewed --execute --limit 3
+python3 scripts/linkedin_outreach.py connect --queued --limit 3 --execute --no-note --navigation-mode random
+```
+
+Do not run fresh scouting immediately after a sync + DM batch unless the user explicitly requests it and there is no active safety cooldown. Prefer already stored, reviewed leads before opening more LinkedIn search pages.
 
 If using a note, queue and review first, then send one lead at a time with a final AI-written, fully personalized note. Do not use placeholders or raw source labels in connection notes:
 
@@ -214,7 +225,7 @@ Before sending DMs, sync contacted leads so accepted connection requests are mar
 `connected` in the local database:
 
 ```bash
-python3 scripts/linkedin_outreach.py sync-connections --contacted --limit 20
+python3 scripts/linkedin_outreach.py sync-connections --contacted --limit 12
 ```
 
 Dry-run first-degree DMs:
@@ -222,6 +233,12 @@ Dry-run first-degree DMs:
 ```bash
 python3 scripts/linkedin_outreach.py dm --lead-id li_abc123
 ```
+
+Before executing any DM batch, review each selected lead's headline and stored
+source evidence against the exact DM text. Only send if the CTA is coherent for
+that person's business and role. Skip or reject leads that are merely tangential,
+competitors, product operators, investors, recruiters, or generic engagers.
+Never rely on a broad signal label alone as proof that the message fits.
 
 Actually send:
 
@@ -249,6 +266,8 @@ Default local state:
   session/session_meta.json     last login metadata
   db/leads.json                 local lead database
   db/signals.json               reusable radar definitions
+  db/safety_state.json          stop-condition cooldown state
+  db/suppressions.json          never-contact profiles, e.g. competitors
   db/actions.jsonl              append-only action/event log
   db/runs.jsonl                 append-only run log
   db/templates.json             editable DM template; connection_note is blank by default

@@ -9,6 +9,8 @@ storage_state.json
 session_meta.json
 leads.json
 signals.json
+safety_state.json
+suppressions.json
 templates.json
 actions.jsonl
 runs.jsonl

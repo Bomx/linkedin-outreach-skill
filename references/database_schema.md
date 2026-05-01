@@ -106,8 +106,10 @@ Common action types:
 
 - `lead_spotted`
 - `lead_updated`
+- `lead_suppressed`
 - `lead_queued`
 - `lead_rejected`
+- `linkedin_stop_condition`
 - `connection_dry_run`
 - `connection_sent`
 - `connection_status_synced`
@@ -187,3 +189,44 @@ Supported DM placeholders:
 - `{headline}`
 - `{source_label}`
 - `{profile_url}`
+
+## db/suppressions.json
+
+Profiles in this file are never inserted or updated as leads. Use it for competitors,
+accounts the operator explicitly does not want to contact, and other permanent
+exclusions.
+
+```json
+{
+  "version": 1,
+  "updated_at": "2026-04-25T12:00:00Z",
+  "profiles": [
+    {
+      "profile_url": "https://www.linkedin.com/in/example-competitor/",
+      "profile_handle": "example-competitor",
+      "reason": "competitor",
+      "added_at": "2026-04-25T12:00:00Z"
+    }
+  ]
+}
+```
+
+## db/safety_state.json
+
+When LinkedIn shows a checkpoint, CAPTCHA, identity verification, restriction, or
+unusual-activity prompt, the script records a local cooldown and refuses new
+browser-heavy commands until the cooldown expires.
+
+```json
+{
+  "version": 1,
+  "updated_at": "2026-04-25T12:00:00Z",
+  "cooldown_until": "2026-04-26T12:00:00Z",
+  "last_stop": {
+    "condition": "verify_your_identity",
+    "detected_at": "2026-04-25T12:00:00Z",
+    "cooldown_hours": 24,
+    "screenshot": "/Users/example/.linkedin-outreach/screenshots/stop_condition_123.png"
+  }
+}
+```
